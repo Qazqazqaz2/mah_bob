@@ -1,0 +1,2 @@
+[console_scripts]
+ai-supervisor = ai_supervisor.main:main

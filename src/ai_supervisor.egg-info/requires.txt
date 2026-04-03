@@ -1,0 +1,10 @@
+aiomax<3,>=2.11
+httpx[socks]<1,>=0.27
+pydantic<3,>=2.6
+pydantic-settings<3,>=2.2
+
+[dev]
+pytest<10,>=8
+
+[gigachat]
+gigachat>=0.1.20

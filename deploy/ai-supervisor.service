@@ -1,0 +1,17 @@
+[Unit]
+Description=AI Supervisor — мониторинг чатов MAX
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/ai-supervisor
+EnvironmentFile=/opt/ai-supervisor/.env
+ExecStart=/opt/ai-supervisor/venv/bin/python -m ai_supervisor
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
