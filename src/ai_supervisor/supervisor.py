@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any
+from typing import Any, Dict, Optional, Set, Tuple
 
 from aiomax import Bot
 from aiomax.types import Message as MaxMessage
@@ -12,10 +12,15 @@ from ai_supervisor import bot_ui
 from ai_supervisor.analysis import AnalysisResult, analyze_transcript, format_transcript
 from ai_supervisor.config import Settings
 from ai_supervisor.llm_base import LLMClient
+from ai_supervisor.llm_factory import build_llm
 from ai_supervisor.notifier import NotificationDispatcher
 from ai_supervisor.storage import StoredLine, SupervisorStorage
 
 logger = logging.getLogger(__name__)
+
+def _is_dialog_suspended_error(e: Exception) -> bool:
+    s = repr(e)
+    return "error.dialog.suspended" in s or "dialog.suspended" in s
 
 
 def _is_probably_group_chat(chat: dict[str, Any]) -> bool:
@@ -41,20 +46,43 @@ class ChatSupervisor:
         *,
         settings: Settings,
         storage: SupervisorStorage,
-        llm: LLMClient,
+        llm: Optional[LLMClient],
         bot: Bot,
         notifier: NotificationDispatcher,
     ) -> None:
         self._settings = settings
         self._storage = storage
-        self._llm = llm
+        self._llm_override = llm
+        self._llm_cache: Optional[Tuple[str, LLMClient]] = None
         self._bot = bot
         self._notifier = notifier
-        self._chat_cache: dict[int, dict[str, Any]] = {}
+        self._chat_cache: Dict[int, Dict[str, Any]] = {}
         self._debounce_tasks: dict[int, asyncio.Task[None]] = {}
+        self._interval_wait_tasks: dict[int, asyncio.Task[None]] = {}
+        self._max_wait_tasks: dict[int, asyncio.Task[None]] = {}
         self._lock = asyncio.Lock()
-        self._dm_hint_shown: set[int] = set()
-        self._dm_menu_throttle: dict[int, float] = {}
+        self._chat_analysis_locks: Dict[int, asyncio.Lock] = {}
+        self._dm_hint_shown: Set[int] = set()
+        self._dm_menu_throttle: Dict[int, float] = {}
+
+    def _active_llm(self) -> LLMClient:
+        if self._llm_override is not None:
+            return self._llm_override
+        want = self._storage.get_llm_provider(self._settings.llm_provider)
+        if self._llm_cache is None or self._llm_cache[0] != want:
+            logger.info("LLM: провайдер %s", want)
+            self._llm_cache = (want, build_llm(self._settings, want))
+        return self._llm_cache[1]
+
+    def _analysis_debounce(self) -> float:
+        return self._storage.get_analysis_debounce_seconds(
+            self._settings.analysis_debounce_seconds
+        )
+
+    def _analysis_max_wait(self) -> float:
+        return self._storage.get_analysis_max_wait_seconds(
+            self._settings.analysis_max_wait_seconds
+        )
 
     def note_user_greeted_on_start(self, user_id: int) -> None:
         self._dm_hint_shown.add(user_id)
@@ -67,6 +95,8 @@ class ChatSupervisor:
         force: bool = False,
         min_interval_sec: float = 14.0,
     ) -> None:
+        if self._storage.is_dialog_suspended(user_id):
+            return
         now = time.monotonic()
         if not force:
             last = self._dm_menu_throttle.get(user_id, 0.0)
@@ -80,7 +110,14 @@ class ChatSupervisor:
                 format="markdown",
                 keyboard=bot_ui.keyboard_main(),
             )
-        except Exception:
+        except Exception as e:
+            if _is_dialog_suspended_error(e):
+                self._storage.mark_dialog_suspended(user_id, True)
+                logger.warning(
+                    "ЛС недоступны (dialog.suspended), user_id=%s — отключаю меню",
+                    user_id,
+                )
+                return
             logger.exception("Не удалось отправить главное меню в chat_id=%s", chat_id)
 
     async def _handle_dialog_message(self, message: MaxMessage, chat_id: int) -> None:
@@ -106,6 +143,16 @@ class ChatSupervisor:
                     keyboard=bot_ui.keyboard_with_back(),
                 )
             except Exception:
+                try:
+                    raise
+                except Exception as e:
+                    if uid is not None and _is_dialog_suspended_error(e):
+                        self._storage.mark_dialog_suspended(uid, True)
+                        logger.warning(
+                            "ЛС недоступны (dialog.suspended), user_id=%s — отключаю ответы",
+                            uid,
+                        )
+                        return
                 logger.exception("Не удалось отправить раздел «О боте»")
             return
 
@@ -131,7 +178,7 @@ class ChatSupervisor:
             return str(t)
         return f"Чат {chat_id}"
 
-    async def _ensure_chat(self, chat_id: int) -> dict[str, Any]:
+    async def _ensure_chat(self, chat_id: int) -> Dict[str, Any]:
         if chat_id in self._chat_cache:
             return self._chat_cache[chat_id]
         try:
@@ -189,7 +236,25 @@ class ChatSupervisor:
             keep_last=max(self._settings.context_window_messages * 3, 200),
         )
 
-        deb = float(self._settings.analysis_debounce_seconds or 0.0)
+        max_wait = float(self._analysis_max_wait() or 0.0)
+        if max_wait > 0:
+            async with self._lock:
+                # Планируем "принудительный" анализ не реже чем раз в max_wait,
+                # даже если debounce постоянно отменяется из-за потока сообщений.
+                mw = self._max_wait_tasks.get(chat_id)
+                if mw is None or mw.done():
+                    async def _force_after() -> None:
+                        try:
+                            await asyncio.sleep(max_wait)
+                            await self._run_analysis(chat_id)
+                        except asyncio.CancelledError:
+                            return
+                        except Exception:
+                            logger.exception("Отложенный анализ (max_wait) chat_id=%s", chat_id)
+
+                    self._max_wait_tasks[chat_id] = asyncio.create_task(_force_after())
+
+        deb = float(self._analysis_debounce() or 0.0)
         if deb <= 0:
             await self._run_analysis(chat_id)
             return
@@ -210,33 +275,113 @@ class ChatSupervisor:
 
             self._debounce_tasks[chat_id] = asyncio.create_task(_delayed())
 
-    async def _run_analysis(self, chat_id: int) -> None:
-        lines = self._storage.recent_context(chat_id, self._settings.context_window_messages)
-        if not lines:
+    async def _chat_analysis_lock(self, chat_id: int) -> asyncio.Lock:
+        async with self._lock:
+            lk = self._chat_analysis_locks.get(chat_id)
+            if lk is None:
+                lk = asyncio.Lock()
+                self._chat_analysis_locks[chat_id] = lk
+            return lk
+
+    async def _run_analysis(
+        self, chat_id: int, *, bypass_interval_gate: bool = False
+    ) -> None:
+        # Если анализ всё же запускается — max_wait можно сбросить,
+        # иначе он будет лишний раз дергать анализ после уже выполненного прогона.
+        async with self._lock:
+            t = self._max_wait_tasks.pop(chat_id, None)
+            if t is not None and not t.done():
+                t.cancel()
+
+        lk = await self._chat_analysis_lock(chat_id)
+
+        async with lk:
+            lines = self._storage.recent_context(
+                chat_id, self._settings.context_window_messages
+            )
+            if not lines:
+                return
+            newest_ts = lines[-1].ts
+            hwm = self._storage.get_chat_analyze_hwm(chat_id)
+            if hwm is not None and newest_ts <= hwm:
+                logger.debug(
+                    "Пропуск анализа: тот же хвост переписки chat_id=%s newest=%s hwm=%s",
+                    chat_id,
+                    newest_ts,
+                    hwm,
+                )
+                return
+
+            min_int = self._storage.get_analysis_min_interval_seconds(
+                self._settings.analysis_min_interval_seconds
+            )
+            delay_for: Optional[float] = None
+            if not bypass_interval_gate and min_int > 0:
+                last_wall = self._storage.get_chat_last_analysis_wall(chat_id)
+                now = time.time()
+                if last_wall is not None and (now - last_wall) < min_int:
+                    delay_for = min_int - (now - last_wall)
+
+        if delay_for is not None and delay_for > 0:
+            async with self._lock:
+                prev = self._interval_wait_tasks.pop(chat_id, None)
+                if prev is not None and not prev.done():
+                    prev.cancel()
+
+                async def _after_interval() -> None:
+                    try:
+                        await asyncio.sleep(delay_for)
+                        await self._run_analysis(
+                            chat_id, bypass_interval_gate=True
+                        )
+                    except asyncio.CancelledError:
+                        return
+                    except Exception:
+                        logger.exception(
+                            "Отложенный анализ (интервал) chat_id=%s", chat_id
+                        )
+
+                self._interval_wait_tasks[chat_id] = asyncio.create_task(
+                    _after_interval()
+                )
             return
-        title = self._label_for_chat(chat_id)
-        transcript = format_transcript(lines)
-        result = await analyze_transcript(
-            self._llm,
-            chat_label=f"{title} ({chat_id})",
-            transcript=transcript,
-        )
-        if not result.alert:
-            return
-        last_ts = lines[-1].ts if lines else None
-        await self._notifier.dispatch(
-            chat_id=chat_id,
-            chat_title=title,
-            message_ts=last_ts,
-            result=result,
-        )
+
+        async with lk:
+            lines = self._storage.recent_context(
+                chat_id, self._settings.context_window_messages
+            )
+            if not lines:
+                return
+            newest_ts = lines[-1].ts
+            hwm = self._storage.get_chat_analyze_hwm(chat_id)
+            if hwm is not None and newest_ts <= hwm:
+                return
+
+            title = self._label_for_chat(chat_id)
+            transcript = format_transcript(lines)
+            result = await analyze_transcript(
+                self._active_llm(),
+                chat_label=f"{title} ({chat_id})",
+                transcript=transcript,
+            )
+            self._storage.set_chat_analyze_hwm(chat_id, newest_ts)
+            self._storage.set_chat_last_analysis_wall(chat_id, time.time())
+            if not result.alert:
+                return
+            last_ts = lines[-1].ts if lines else None
+            await self._notifier.dispatch(
+                chat_id=chat_id,
+                chat_title=title,
+                message_ts=last_ts,
+                result=result,
+            )
 
     async def analyze_lines(self, chat_id: int, lines: list[StoredLine]) -> AnalysisResult:
         await self._ensure_chat(chat_id)
         title = self._label_for_chat(chat_id)
         transcript = format_transcript(lines)
         return await analyze_transcript(
-            self._llm,
+            self._active_llm(),
             chat_label=f"{title} ({chat_id})",
             transcript=transcript,
         )

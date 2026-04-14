@@ -7,9 +7,10 @@ name = "ai-supervisor"
 version = "0.1.0"
 description = "AI-бот мониторинга рабочих чатов MAX с анализом через YandexGPT / GigaChat"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.9"
 dependencies = [
   "aiomax>=2.11,<3",
+  "aiohttp>=3.9,<4",
   "httpx[socks]>=0.27,<1",
   "pydantic>=2.6,<3",
   "pydantic-settings>=2.2,<3",

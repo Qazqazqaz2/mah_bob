@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Literal
+from typing import Literal, Optional, Set
 
 from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     # Дальше настройки в боте / в таблицах duty_users, monitored_chats, kv.
     monitored_chat_ids: str = ""
 
-    manager_chat_id: int | None = Field(default=None)
+    manager_chat_id: Optional[int] = Field(default=None)
     duty_user_ids: str = ""
 
     # Кто может менять настройки в ЛС (через запятую). Пусто = любой пользователь в ЛС.
@@ -52,6 +52,22 @@ class Settings(BaseSettings):
         ge=0,
         validation_alias=AliasChoices("ANALYSIS_DEBOUNCE_SECONDS", "SUPERVISOR_ANALYZE_DEBOUNCE_SECONDS"),
     )
+    analysis_min_interval_seconds: float = Field(
+        default=0.0,
+        ge=0,
+        validation_alias=AliasChoices(
+            "ANALYSIS_MIN_INTERVAL_SECONDS",
+            "SUPERVISOR_ANALYZE_MIN_INTERVAL_SECONDS",
+        ),
+    )
+    analysis_max_wait_seconds: float = Field(
+        default=0.0,
+        ge=0,
+        validation_alias=AliasChoices(
+            "ANALYSIS_MAX_WAIT_SECONDS",
+            "SUPERVISOR_ANALYZE_MAX_WAIT_SECONDS",
+        ),
+    )
 
     long_poll_timeout: int = Field(default=45, ge=0, le=90)
     long_poll_limit: int = Field(default=100, ge=1, le=1000)
@@ -80,7 +96,7 @@ class Settings(BaseSettings):
             return ""
         return str(v).strip()
 
-    def monitored_chat_id_set(self) -> set[int] | None:
+    def monitored_chat_id_set(self) -> Optional[Set[int]]:
         raw = self.monitored_chat_ids.replace(" ", "")
         if not raw:
             return None
@@ -92,7 +108,7 @@ class Settings(BaseSettings):
             return []
         return [int(x) for x in raw.split(",") if x]
 
-    def bot_admin_id_set(self) -> set[int] | None:
+    def bot_admin_id_set(self) -> Optional[Set[int]]:
         raw = self.bot_admin_user_ids.replace(" ", "")
         if not raw:
             return None

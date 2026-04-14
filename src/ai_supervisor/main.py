@@ -4,6 +4,9 @@ import asyncio
 import logging
 import sys
 
+import aiohttp
+from aiohttp.hdrs import ACCEPT_ENCODING, AUTHORIZATION
+
 from ai_supervisor.aiomax_bot import SupervisorBot
 from ai_supervisor.config import Settings, get_settings
 from ai_supervisor.llm_factory import build_llm
@@ -20,6 +23,7 @@ def _setup_logging(level: str) -> None:
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 def _validate_notifications(storage: SupervisorStorage) -> None:
@@ -36,7 +40,13 @@ async def run_aiomax() -> None:
     storage = SupervisorStorage(s.sqlite_path)
     storage.seed_runtime_from_env(s)
     _validate_notifications(storage)
-    llm = build_llm(s)
+    try:
+        build_llm(s, storage.get_llm_provider(s.llm_provider))
+    except Exception as e:
+        logger.warning(
+            "Текущий провайдер LLM не собрался при старте (проверьте .env или смените модель в боте): %s",
+            e,
+        )
     bot = SupervisorBot(
         storage,
         poll_timeout=s.long_poll_timeout,
@@ -51,7 +61,7 @@ async def run_aiomax() -> None:
     sup = ChatSupervisor(
         settings=s,
         storage=storage,
-        llm=llm,
+        llm=None,
         bot=bot,
         notifier=notifier,
     )
@@ -81,7 +91,15 @@ async def run_aiomax() -> None:
     async def _on_message(message):  # noqa: ANN001
         await sup.handle_aiomax_message(message)
 
-    await bot.start_polling()
+    # Без br: иначе API MAX может отдать Brotli, а связка aiohttp + Brotli на части
+    # установок падает (process() / декодер). Явный Accept-Encoding — только gzip/deflate.
+    max_session = aiohttp.ClientSession(
+        headers={
+            AUTHORIZATION: s.max_access_token,
+            ACCEPT_ENCODING: "gzip, deflate",
+        }
+    )
+    await bot.start_polling(session=max_session)
 
 
 def run_sync() -> None:

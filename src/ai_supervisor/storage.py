@@ -7,19 +7,20 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import List, Literal, Optional, Set, Tuple
 
 from ai_supervisor.config import Settings
 
 logger = logging.getLogger(__name__)
 
 MonitorMode = Literal["all", "list"]
+LLMProvider = Literal["yandex", "gigachat"]
 
 
 @dataclass(frozen=True)
 class StoredLine:
     ts: int
-    sender_id: int | None
+    sender_id: Optional[int]
     sender_name: str
     text: str
 
@@ -235,7 +236,7 @@ class SupervisorStorage:
             )
             return "rowid"
 
-    def _kv_get(self, c: sqlite3.Connection, key: str) -> str | None:
+    def _kv_get(self, c: sqlite3.Connection, key: str) -> Optional[str]:
         row = c.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
         return row[0] if row else None
 
@@ -281,10 +282,26 @@ class SupervisorStorage:
                 )
             c.execute(
                 "INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                ("llm_provider", settings.llm_provider),
+            )
+            c.execute(
+                "INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                ("analysis_debounce_sec", str(settings.analysis_debounce_seconds)),
+            )
+            c.execute(
+                "INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                ("analysis_min_interval_sec", str(settings.analysis_min_interval_seconds)),
+            )
+            c.execute(
+                "INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                ("analysis_max_wait_sec", str(settings.analysis_max_wait_seconds)),
+            )
+            c.execute(
+                "INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 ("runtime_seeded", "1"),
             )
 
-    def get_manager_chat_id(self) -> int | None:
+    def get_manager_chat_id(self) -> Optional[int]:
         with self._lock, self._connect() as c:
             v = self._kv_get(c, "manager_chat_id")
         if not v:
@@ -294,7 +311,7 @@ class SupervisorStorage:
         except ValueError:
             return None
 
-    def set_manager_chat_id(self, chat_id: int | None) -> None:
+    def set_manager_chat_id(self, chat_id: Optional[int]) -> None:
         if chat_id is None:
             self._kv_del("manager_chat_id")
         else:
@@ -315,6 +332,130 @@ class SupervisorStorage:
         """Переключить на режим «только список» (таблицу не очищаем)."""
         if self.get_monitor_mode() != "list":
             self._kv_set("monitor_mode", "list")
+
+    def get_llm_provider(self, default: str = "yandex") -> LLMProvider:
+        """Провайдер из SQLite; если ключа нет — default (обычно из .env)."""
+        with self._lock, self._connect() as c:
+            v = self._kv_get(c, "llm_provider")
+        if not v:
+            d = default.strip().lower()
+            return "gigachat" if d == "gigachat" else "yandex"
+        s = v.strip().lower()
+        if s in {"yandexgpt", "yandex-gpt"}:
+            return "yandex"
+        if s == "gigachat":
+            return "gigachat"
+        if s == "yandex":
+            return "yandex"
+        d = default.strip().lower()
+        return "gigachat" if d == "gigachat" else "yandex"
+
+    def set_llm_provider(self, provider: str) -> None:
+        s = provider.strip().lower()
+        if s in {"yandexgpt", "yandex-gpt"}:
+            s = "yandex"
+        if s not in ("yandex", "gigachat"):
+            raise ValueError("llm_provider: ожидается yandex или gigachat")
+        self._kv_set("llm_provider", s)
+
+    def get_analysis_debounce_seconds(self, default: float) -> float:
+        with self._lock, self._connect() as c:
+            v = self._kv_get(c, "analysis_debounce_sec")
+        if v is None or not str(v).strip():
+            return float(default)
+        try:
+            x = float(v)
+            return x if x >= 0 else float(default)
+        except ValueError:
+            return float(default)
+
+    def set_analysis_debounce_seconds(self, sec: float) -> None:
+        self._kv_set("analysis_debounce_sec", str(max(0.0, float(sec))))
+
+    def get_analysis_min_interval_seconds(self, default: float) -> float:
+        with self._lock, self._connect() as c:
+            v = self._kv_get(c, "analysis_min_interval_sec")
+        if v is None or not str(v).strip():
+            return float(default)
+        try:
+            x = float(v)
+            return x if x >= 0 else float(default)
+        except ValueError:
+            return float(default)
+
+    def set_analysis_min_interval_seconds(self, sec: float) -> None:
+        self._kv_set("analysis_min_interval_sec", str(max(0.0, float(sec))))
+
+    def get_analysis_max_wait_seconds(self, default: float) -> float:
+        with self._lock, self._connect() as c:
+            v = self._kv_get(c, "analysis_max_wait_sec")
+        if v is None or not str(v).strip():
+            return float(default)
+        try:
+            x = float(v)
+            return x if x >= 0 else float(default)
+        except ValueError:
+            return float(default)
+
+    def set_analysis_max_wait_seconds(self, sec: float) -> None:
+        self._kv_set("analysis_max_wait_sec", str(max(0.0, float(sec))))
+
+    def _load_json_map(self, key: str) -> dict[str, object]:
+        with self._lock, self._connect() as c:
+            raw = self._kv_get(c, key)
+        if not raw:
+            return {}
+        try:
+            d = json.loads(raw)
+            return d if isinstance(d, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+
+    def _save_json_map(self, key: str, data: dict[str, object]) -> None:
+        self._kv_set(key, json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+
+    def is_dialog_suspended(self, user_id: int) -> bool:
+        d = self._load_json_map("dialog_suspended_users")
+        return bool(d.get(str(int(user_id))))
+
+    def mark_dialog_suspended(self, user_id: int, suspended: bool = True) -> None:
+        d = self._load_json_map("dialog_suspended_users")
+        k = str(int(user_id))
+        if suspended:
+            d[k] = 1
+        else:
+            d.pop(k, None)
+        self._save_json_map("dialog_suspended_users", d)
+
+    def get_chat_analyze_hwm(self, chat_id: int) -> Optional[int]:
+        d = self._load_json_map("chat_analyze_hwm")
+        k = str(chat_id)
+        if k not in d:
+            return None
+        try:
+            return int(d[k])  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+
+    def set_chat_analyze_hwm(self, chat_id: int, ts: int) -> None:
+        d = self._load_json_map("chat_analyze_hwm")
+        d[str(chat_id)] = int(ts)
+        self._save_json_map("chat_analyze_hwm", d)
+
+    def get_chat_last_analysis_wall(self, chat_id: int) -> Optional[float]:
+        d = self._load_json_map("chat_last_analysis_wall")
+        k = str(chat_id)
+        if k not in d:
+            return None
+        try:
+            return float(d[k])  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+
+    def set_chat_last_analysis_wall(self, chat_id: int, wall: float) -> None:
+        d = self._load_json_map("chat_last_analysis_wall")
+        d[str(chat_id)] = float(wall)
+        self._save_json_map("chat_last_analysis_wall", d)
 
     def list_monitored_chat_ids(self) -> list[int]:
         with self._lock, self._connect() as c:
@@ -338,7 +479,7 @@ class SupervisorStorage:
         with self._lock, self._connect() as c:
             c.execute("DELETE FROM monitored_chats")
 
-    def monitored_chat_filter(self) -> set[int] | None:
+    def monitored_chat_filter(self) -> Optional[Set[int]]:
         """None = все группы; иначе только перечисленные id (режим list)."""
         if self.get_monitor_mode() != "list":
             return None
@@ -358,7 +499,7 @@ class SupervisorStorage:
         with self._lock, self._connect() as c:
             c.execute("DELETE FROM duty_users WHERE user_id=?", (user_id,))
 
-    def touch_known_chat(self, chat_id: int, title: str | None) -> None:
+    def touch_known_chat(self, chat_id: int, title: Optional[str]) -> None:
         ts = int(time.time() * 1000)
         with self._lock, self._connect() as c:
             c.execute(
@@ -371,7 +512,7 @@ class SupervisorStorage:
                 (chat_id, title, ts),
             )
 
-    def list_known_chats(self, limit: int = 12) -> list[tuple[int, str | None]]:
+    def list_known_chats(self, limit: int = 12) -> List[Tuple[int, Optional[str]]]:
         with self._lock, self._connect() as c:
             rows = c.execute(
                 """
@@ -383,14 +524,14 @@ class SupervisorStorage:
             ).fetchall()
         return [(int(r[0]), r[1]) for r in rows]
 
-    def get_marker(self) -> int | None:
+    def get_marker(self) -> Optional[int]:
         with self._lock, self._connect() as c:
             row = c.execute("SELECT value FROM kv WHERE key='max_marker'").fetchone()
             if not row:
                 return None
             return int(row[0])
 
-    def set_marker(self, marker: int | None) -> None:
+    def set_marker(self, marker: Optional[int]) -> None:
         if marker is None:
             return
         with self._lock, self._connect() as c:
@@ -404,7 +545,7 @@ class SupervisorStorage:
         *,
         chat_id: int,
         ts: int,
-        sender_id: int | None,
+        sender_id: Optional[int],
         sender_name: str,
         text: str,
         keep_last: int,
@@ -440,11 +581,12 @@ class SupervisorStorage:
             rows = c.execute(
                 f"""
                 SELECT ts, sender_id, sender_name, text FROM (
-                  SELECT ts, sender_id, sender_name, text FROM chat_messages
+                  SELECT ts, sender_id, sender_name, text, {oc}
+                  FROM chat_messages
                   WHERE chat_id=?
                   ORDER BY ts DESC, {oc} DESC
                   LIMIT ?
-                )
+                ) AS recent
                 ORDER BY ts ASC, {oc} ASC
                 """,
                 (chat_id, limit),

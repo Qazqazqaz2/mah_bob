@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Protocol
+from typing import Any, Optional, Protocol
 
 
 class OutgoingMessage(Protocol):
-    chat_id: int | None
-    user_id: int | None
+    chat_id: Optional[int]
+    user_id: Optional[int]
     text: str
 
 
@@ -16,10 +16,12 @@ class MessengerAdapter(ABC):
     name: str = "abstract"
 
     @abstractmethod
-    async def send_text(self, *, chat_id: int | None, user_id: int | None, text: str) -> None:
+    async def send_text(
+        self, *, chat_id: Optional[int], user_id: Optional[int], text: str
+    ) -> None:
         raise NotImplementedError
 
     @abstractmethod
-    def normalize_incoming(self, raw: dict[str, Any]) -> dict[str, Any] | None:
+    def normalize_incoming(self, raw: dict[str, Any]) -> Optional[dict[str, Any]]:
         """Приводит входящее событие к виду, похожему на MAX Update, или None если не поддерживается."""
         raise NotImplementedError

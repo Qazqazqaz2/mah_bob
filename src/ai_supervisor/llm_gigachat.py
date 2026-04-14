@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
 
 from ai_supervisor.llm_base import LLMClient
 
@@ -17,7 +18,7 @@ class GigaChatLLMClient(LLMClient):
     Требуется: pip install gigachat
     """
 
-    def __init__(self, *, credentials: str, model: str | None = None) -> None:
+    def __init__(self, *, credentials: str, model: Optional[str] = None) -> None:
         try:
             from gigachat import GigaChat  # type: ignore[import-not-found]
         except ImportError as e:

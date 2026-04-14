@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
 from ai_supervisor.config import Settings
 from ai_supervisor.llm_base import LLMClient
@@ -10,8 +11,11 @@ from ai_supervisor.llm_yandex import YandexGPTClient
 logger = logging.getLogger(__name__)
 
 
-def build_llm(settings: Settings) -> LLMClient:
-    if settings.llm_provider == "yandex":
+def build_llm(settings: Settings, provider: Optional[str] = None) -> LLMClient:
+    p = (provider or settings.llm_provider).strip().lower()
+    if p in {"yandexgpt", "yandex-gpt"}:
+        p = "yandex"
+    if p == "yandex":
         if not settings.yandex_folder_id:
             raise ValueError("YandexGPT: задайте YANDEX_FOLDER_ID")
         has_iam = bool((settings.yandex_iam_token or "").strip())
@@ -30,7 +34,9 @@ def build_llm(settings: Settings) -> LLMClient:
             temperature=settings.yandex_temperature,
             max_tokens=settings.yandex_max_tokens,
         )
-    if not settings.gigachat_credentials:
-        raise ValueError("GigaChat: задайте GIGACHAT_CREDENTIALS")
-    logger.info("LLM: GigaChat")
-    return GigaChatLLMClient(credentials=settings.gigachat_credentials)
+    if p == "gigachat":
+        if not settings.gigachat_credentials:
+            raise ValueError("GigaChat: задайте GIGACHAT_CREDENTIALS")
+        logger.info("LLM: GigaChat")
+        return GigaChatLLMClient(credentials=settings.gigachat_credentials)
+    raise ValueError(f"Неизвестный llm_provider: {p!r}")
