@@ -68,6 +68,14 @@ class Settings(BaseSettings):
             "SUPERVISOR_ANALYZE_MAX_WAIT_SECONDS",
         ),
     )
+    alert_max_age_seconds: float = Field(
+        default=0.0,
+        ge=0,
+        validation_alias=AliasChoices(
+            "ALERT_MAX_AGE_SECONDS",
+            "SUPERVISOR_ALERT_MAX_AGE_SECONDS",
+        ),
+    )
 
     long_poll_timeout: int = Field(default=45, ge=0, le=90)
     long_poll_limit: int = Field(default=100, ge=1, le=1000)

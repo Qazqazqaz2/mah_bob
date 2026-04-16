@@ -369,6 +369,17 @@ class ChatSupervisor:
             if not result.alert:
                 return
             last_ts = lines[-1].ts if lines else None
+            max_age = float(self._settings.alert_max_age_seconds or 0.0)
+            if max_age > 0 and last_ts is not None:
+                now_ms = int(time.time() * 1000)
+                if now_ms - int(last_ts) > int(max_age * 1000):
+                    logger.info(
+                        "Алерт не отправлен: контекст слишком старый (age_sec=%s > max_age_sec=%s) chat_id=%s",
+                        round((now_ms - int(last_ts)) / 1000.0, 1),
+                        max_age,
+                        chat_id,
+                    )
+                    return
             await self._notifier.dispatch(
                 chat_id=chat_id,
                 chat_title=title,

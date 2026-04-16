@@ -97,6 +97,44 @@ _SOFT_RULES: list[tuple[re.Pattern[str], str]] = [
     ),
 ]
 
+_DELAY_RULES: list[tuple[re.Pattern[str], str]] = [
+    (
+        re.compile(
+            r"\bуже\s+(?:недел[яи]|[2-9]\s*дн[яей])\s+жд[её]м\b|\bжд[её]м\s+уже\s+(?:недел[яи]|[2-9]\s*дн[яей])\b",
+            re.I | re.UNICODE,
+        ),
+        "долгое ожидание ответа (неделя+)",
+    ),
+    (
+        re.compile(
+            r"\bобещал[аио]?\b|\bнам\s+обещал[аио]?\b|\bобещал[аио]?\s+прислат[ьй]\b",
+            re.I | re.UNICODE,
+        ),
+        "обещали и не сделали",
+    ),
+    (
+        re.compile(
+            r"\bещ[её]\s+в\s+(?:понедельник|вторник|сред\w+|четверг|пятниц\w+|суббот\w+|воскресень\w+)\b",
+            re.I | re.UNICODE,
+        ),
+        "сорванный срок (по дню недели)",
+    ),
+    (
+        re.compile(
+            r"\bтак\s+и\s+не\s+(?:прислал[аио]?|получил[аио]?|получили)\b|\bне\s+пришл[оаи]?\b|\bнет\s+ответа\b",
+            re.I | re.UNICODE,
+        ),
+        "нет ответа / не прислали",
+    ),
+    (
+        re.compile(
+            r"\bвариант\w*\s+площадк\w*\b|\bплощадк\w*\b",
+            re.I | re.UNICODE,
+        ),
+        "ожидание вариантов площадки",
+    ),
+]
+
 
 def transcript_conflict_signals(transcript: str) -> tuple[bool, list[str]]:
     if not transcript or not transcript.strip():
@@ -130,6 +168,21 @@ def transcript_tension_signals(transcript: str) -> list[str]:
     return hits
 
 
+def transcript_delay_signals(transcript: str) -> list[str]:
+    """Маркеры задержек/срыва ожиданий (вежливые, но риск потери доверия)."""
+    if not transcript or not transcript.strip():
+        return []
+    lines = transcript.strip().splitlines()
+    tail = "\n".join(lines[-_LOOKBACK_LINES:])
+    blob = tail.lower()
+    hits: list[str] = []
+    for rx, label in _DELAY_RULES:
+        if rx.search(tail) or rx.search(blob):
+            if label not in hits:
+                hits.append(label)
+    return hits
+
+
 # ts в логе — число мс или иной текст в скобках (не только цифры подряд)
 _TRANSCRIPT_LINE_RE = re.compile(r"^\[([^\]]+)\]\s+(.+?):\s*(.*)$", re.DOTALL)
 
@@ -146,6 +199,13 @@ def _text_triggers_any_soft_rule(text: str) -> bool:
     if not t:
         return False
     return any(rx.search(t) for rx, _ in _SOFT_RULES)
+
+
+def _text_triggers_any_delay_rule(text: str) -> bool:
+    t = text.strip()
+    if not t:
+        return False
+    return any(rx.search(t) for rx, _ in _DELAY_RULES)
 
 
 def transcript_conflict_message_evidence(
@@ -208,6 +268,43 @@ def transcript_tension_message_evidence(
         name = m.group(2).strip()
         text = (m.group(3) or "").strip()
         if not _text_triggers_any_soft_rule(text):
+            continue
+        norm_body = " ".join(text.split()).casefold()[:400]
+        dedupe = (name.casefold(), norm_body)
+        if dedupe in seen_key:
+            continue
+        seen_key.add(dedupe)
+        one_line = " ".join(text.split())
+        if len(one_line) > max_text_len:
+            one_line = one_line[: max_text_len - 1] + "…"
+        evidence.append(f"{name}: {one_line}")
+        senders.append(name)
+        if len(evidence) >= max_items:
+            break
+    who = ", ".join(dict.fromkeys(senders))
+    return evidence, who
+
+
+def transcript_delay_message_evidence(
+    transcript: str,
+    *,
+    max_items: int = 5,
+    max_text_len: int = 420,
+) -> tuple[list[str], str]:
+    """Реплики из хвоста, где видны задержки/ожидание (качество сервиса)."""
+    if not transcript or not transcript.strip():
+        return [], ""
+    tail = transcript.strip().splitlines()[-_LOOKBACK_LINES:]
+    evidence: list[str] = []
+    senders: list[str] = []
+    seen_key: set[tuple[str, str]] = set()
+    for raw in tail:
+        m = _TRANSCRIPT_LINE_RE.match(raw.strip())
+        if not m:
+            continue
+        name = m.group(2).strip()
+        text = (m.group(3) or "").strip()
+        if not _text_triggers_any_delay_rule(text):
             continue
         norm_body = " ".join(text.split()).casefold()[:400]
         dedupe = (name.casefold(), norm_body)
